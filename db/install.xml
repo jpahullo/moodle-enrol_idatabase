@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<XMLDB PATH="enrol/idatabase/db" VERSION="20130627" COMMENT="XMLDB file for Moodle enrol/idatabase"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="../../../lib/xmldb/xmldb.xsd"
+>
+  <TABLES>
+    <TABLE NAME="enrol_idatabase" COMMENT="List of courses created from records on the external database. This will help to detect those courses that do not appear from sync to sync.">
+      <FIELDS>
+        <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true" NEXT="courseid"/>
+        <FIELD NAME="courseid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false" COMMENT="Local Moodle course.id field" PREVIOUS="id" NEXT="remoteid"/>
+        <FIELD NAME="remoteid" TYPE="int" LENGTH="10" NOTNULL="false" DEFAULT="0" SEQUENCE="false" COMMENT="Id of the course in the remote database when mapped to the local course.id field." PREVIOUS="courseid" NEXT="remoteidnumber"/>
+        <FIELD NAME="remoteidnumber" TYPE="char" LENGTH="100" NOTNULL="false" DEFAULT="null" SEQUENCE="false" COMMENT="Id of the course in the remote database when mapped to the local course.idnumber field." PREVIOUS="remoteid" NEXT="remoteshortname"/>
+        <FIELD NAME="remoteshortname" TYPE="char" LENGTH="255" NOTNULL="false" DEFAULT="null" SEQUENCE="false" COMMENT="Id of the course in the remote database when mapped to the local course.shortname field." PREVIOUS="remoteidnumber" NEXT="timemodified"/>
+        <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false" COMMENT="Time of the last sync of this record." PREVIOUS="remoteshortname"/>
+      </FIELDS>
+      <KEYS>
+        <KEY NAME="primary" TYPE="primary" FIELDS="id"/>
+      </KEYS>
+      <INDEXES>
+        <INDEX NAME="courseididx" UNIQUE="true" FIELDS="courseid" NEXT="remoteididx"/>
+        <INDEX NAME="remoteididx" UNIQUE="true" FIELDS="remoteid" PREVIOUS="courseididx" NEXT="remoteidnumberidx"/>
+        <INDEX NAME="remoteidnumberidx" UNIQUE="true" FIELDS="remoteidnumber" PREVIOUS="remoteididx" NEXT="remoteshortnameidx"/>
+        <INDEX NAME="remoteshortnameidx" UNIQUE="true" FIELDS="remoteshortname" PREVIOUS="remoteidnumberidx"/>
+      </INDEXES>
+    </TABLE>
+  </TABLES>
+</XMLDB>

@@ -12,12 +12,31 @@
 
 defined('MOODLE_INTERNAL') || die();
 
+ini_set('display_errors', true);
+ini_set('error_reporting', E_ALL);
+
 /**
  * Improved database enrolment plugin implementation.
  * @copyright  2013 Jordi Pujol-Ahulló
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class enrol_idatabase_plugin extends enrol_plugin {
+
+    /**
+     * @var int No action to do when a course disappears from the external database.
+     */
+    const MISSING_COURSE_NO_ACTION = 0;
+    /**
+     * @var int Move the course to the specified category when it
+     * disappears from the external database.
+     */
+    const MISSING_COURSE_MOVE_TO_CATEGORY = 1;
+    /**
+     * @var int Hide the course when  it disappears from the external database.
+     */
+    const MISSING_COURSE_HIDE = 2;
+
+
     /**
      * Is it possible to delete enrol instance via standard UI?
      *
@@ -651,6 +670,21 @@ class enrol_idatabase_plugin extends enrol_plugin {
         $idnumber  = trim($this->get_config('newcourseidnumber'));
         $category  = trim($this->get_config('newcoursecategory'));
 
+        //sync category info from created courses?
+        $catsynced = $this->get_config('newcoursecategorysynced');
+        //action to do when course is missing on external database
+        $missingaction = intval($this->get_config('missingcourseaction'));
+        if ($verbose) {
+            mtrace('INFO: Action to do for missing courses on external database: '.
+                    get_string('missingcourseaction'.$missingaction, 'enrol_idatabase'));
+        }
+        $missingcoursecategoryid = $this->get_config('missingcoursecategory');
+        $missingcoursecategory = $DB->get_record('course_categories', array('id'=>$missingcoursecategoryid));
+        if ($verbose && $missingaction == self::MISSING_COURSE_MOVE_TO_CATEGORY) {
+            mtrace('INFO: Category where to place missing courses: '.
+                    $missingcoursecategory->name . ' ('. $missingcoursecategoryid . ')');
+        }
+
         // Lowercased versions - necessary because we normalise the resultset with array_change_key_case().
         $fullname_l  = strtolower($fullname);
         $shortname_l = strtolower($shortname);
@@ -659,6 +693,9 @@ class enrol_idatabase_plugin extends enrol_plugin {
 
         $localcategoryfield = $this->get_config('localcategoryfield', 'id');
         $defaultcategory    = $this->get_config('defaultcategory');
+
+        $thresholdtime = time();
+        $this->clean_log($verbose);
 
         if (!$DB->record_exists('course_categories', array('id'=>$defaultcategory))) {
             if ($verbose) {
@@ -678,9 +715,10 @@ class enrol_idatabase_plugin extends enrol_plugin {
         }
         $sql = $this->db_get_sql($table, array(), $sqlfields, true);
         $createcourses = array();
-        if ($rs = $extdb->Execute($sql)) {
+        $coursesmoved = false;
+        if (($rs = $extdb->Execute($sql))) {
             if (!$rs->EOF) {
-                while ($fields = $rs->FetchRow()) {
+                while (($fields = $rs->FetchRow())) {
                     $fields = array_change_key_case($fields, CASE_LOWER);
                     $fields = $this->db_decode($fields);
                     if (empty($fields[$shortname_l]) or empty($fields[$fullname_l])) {
@@ -689,7 +727,23 @@ class enrol_idatabase_plugin extends enrol_plugin {
                         }
                         continue;
                     }
-                    if ($DB->record_exists('course', array('shortname'=>$fields[$shortname_l]))) {
+                    if (($course = $DB->get_record('course', array('shortname'=>$fields[$shortname_l])))) {
+                        //if remote course exists locally, check its category; otherwise, next course.
+                        if ($catsynced) {
+                            $externalcategory = $DB->get_record('course_categories', array($localcategoryfield => $fields[$category_l]));
+                            if (!$externalcategory) {
+                                if ($verbose) {
+                                    mtrace('  error: category from external database \''.
+                                        $localcategoryfield . '\'=\'' . $fields[$category_l] .
+                                        '\' is missing. course with \'shortname\'=\'' . $fields[$shortname_l] . '\' is not moved.');
+                                }
+                            } else if ($externalcategory->id != $course->category) {
+                                //external course category has change, update local course
+                                $this->move_course($course, $externalcategory->id);
+                                $coursesmoved = true;
+                            }
+                        }
+                        $this->update_course_log($course->id);
                         // Already exists, skip.
                         continue;
                     }
@@ -708,7 +762,7 @@ class enrol_idatabase_plugin extends enrol_plugin {
                         if (empty($fields[$category_l])) {
                             // Empty category means use default.
                             $course->category = $defaultcategory;
-                        } else if ($coursecategory = $DB->get_record('course_categories', array($localcategoryfield=>$fields[$category_l]), 'id')) {
+                        } else if (($coursecategory = $DB->get_record('course_categories', array($localcategoryfield=>$fields[$category_l]), 'id'))) {
                             // Yay, correctly specified category!
                             $course->category = $coursecategory->id;
                             unset($coursecategory);
@@ -788,8 +842,9 @@ class enrol_idatabase_plugin extends enrol_plugin {
                     continue;
                 }
                 $c = create_course($newcourse);
+                $this->insert_course_log($c->id);
                 if ($verbose) {
-                    mtrace("  creating course: $c->id, $c->fullname, $c->shortname, $c->idnumber, $c->category");
+                    mtrace("  created course: $c->id, $c->fullname, $c->shortname, $c->idnumber, $c->category");
                 }
             }
 
@@ -800,11 +855,153 @@ class enrol_idatabase_plugin extends enrol_plugin {
         // Close db connection.
         $extdb->Close();
 
+        // actions to do after creating/updating courses from external database:
+        // 1. diff from list of updated/created courses from those created
+        //    from external database.
+        // 2. if missing courses from external database:
+        //    * move to a given category, or
+        //    * hide to students.
+        if ($missingaction !== self::MISSING_COURSE_NO_ACTION) {
+            $missingcourses = $this->get_missing_courses($thresholdtime);
+            if (!empty($missingcourses)) {
+                if ($missingaction === self::MISSING_COURSE_MOVE_TO_CATEGORY) {
+                    foreach ($missingcourses as $tomove) {
+                        $course = $DB->get_record('course', array('id' => $tomove->courseid));
+                        if ($course->category == $missingcoursecategoryid) {
+                            //already in category.
+                            continue;
+                        }
+                        $this->move_course($course, $missingcoursecategoryid);
+                        $coursesmoved = true;
+                    }
+                } else if ($missingaction === self::MISSING_COURSE_HIDE) {
+                    foreach($missingcourses as $tomove) {
+                        $c = $DB->get_record('course', array('id' => $tomove->courseid));
+                        if ($c->visible == 0) {
+                            //already hidden
+                            continue;
+                        }
+                        $course = new stdClass();
+                        $course->id = $tomove->courseid;
+                        $course->visible = 0;
+                        $course->visibleold = 0;
+                        $DB->update_record('course', $course);
+                        // make sure the modinfo cache is reset
+                        rebuild_course_cache($tomove->courseid);
+                    }
+                } else {
+                    if ($verbose) {
+                        mtrace('error: no valid action when found missing courses');
+                    }
+                }
+            } else {
+                if ($verbose) {
+                    mtrace('INFO: no missing courses. nothing to do.');
+                }
+            }
+        }
+
+        // updates courses order
+        if ($coursesmoved) {
+            fix_course_sortorder();
+        }
+
         if ($verbose) {
             mtrace('...course synchronisation finished.');
         }
 
         return 0;
+    }
+
+    /**
+     * Move the given $course to the given $categoryid
+     * @param object $course mdl_course record
+     * @param int $categoryid new category id where to move the $course.
+     */
+    protected function move_course($course, $categoryid) {
+        global $DB;
+
+        //external course category has change, update local course
+        $course->timemodified = time();
+        $course->category = $categoryid;
+        // Update with the new data
+        $DB->update_record('course', $course);
+        // make sure the modinfo cache is reset
+        rebuild_course_cache($course->id);
+
+        $course = $DB->get_record('course', array('id'=>$course->id));
+        $context = context_course::instance($course->id);
+
+        $newparent = context_coursecat::instance($course->category);
+        context_moved($context, $newparent);
+    }
+
+    /**
+     * Insert an enrol_idatabase record for the given $courseid.
+     * @param int $courseid Moodle course id related to an external course.
+     */
+    protected function insert_course_log($courseid) {
+        global $DB;
+
+        $log = new stdClass();
+        $log->courseid = $courseid;
+        $log->timemodified = time();
+        $DB->insert_record('enrol_idatabase', $log);
+    }
+
+    /**
+     * Updates an enrol_idatabase record for the given $courseid. It creates
+     * a new record or updates an existing one.
+     * @param int $courseid
+     */
+    protected function update_course_log($courseid) {
+        global $DB;
+
+        $log = $DB->get_record('enrol_idatabase', array('courseid' => $courseid));
+        if (!$log) {
+            $this->insert_course_log($courseid);
+        } else {
+            $log->courseid = $courseid;
+            $log->timemodified = time();
+            $DB->update_record('enrol_idatabase', $log);
+        }
+    }
+
+    /**
+     * Get the list of enrol_idatabase records that where not updated on
+     * the current sync.
+     * @param int $beforetime time
+     * @return bool|array false if all entries where updated; an array of records
+     * that where not updated on the current sync.
+     */
+    protected function get_missing_courses($beforetime) {
+        global $DB;
+
+        return $DB->get_records_select('enrol_idatabase', 'timemodified < ?', array($beforetime));
+    }
+
+    /**
+     * Updates enrol_idatabase to remove all removed Moodle courses to leave
+     * only available courses.
+     * @param type $verbose
+     */
+    protected function clean_log($verbose) {
+        global $DB;
+
+        $unexistingcourses = $DB->get_records_sql(
+            "SELECT ei.id
+             FROM {enrol_idatabase} ei
+             LEFT JOIN {course} c ON (c.id = ei.courseid)
+             WHERE c.id IS NULL");
+        if ($unexistingcourses) {
+            if ($verbose) {
+                mtrace('Cleaning enrol_idatabase from mismatching Moodle courses: ' .
+                    count($unexistingcourses) . ' records to clean.');
+            }
+            foreach ($unexistingcourses as $c) {
+                $DB->delete_records('enrol_idatabase', array('id' => $c->id));
+            }
+        }
     }
 
     protected function db_get_sql($table, array $conditions, array $fields, $distinct = false, $sort = "") {
